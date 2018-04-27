@@ -302,15 +302,6 @@ class Summarization_Model(nn.Module):
 				if use_cuda:
 					p_copy = p_copy.cuda()
 				
-				'''
-				print("attn size = {}".format(attn.size()))
-				print("batch_indices:\n")
-				print(batch_indices)
-				print("word_indices:\n")
-				print(word_indices)
-				print("idx_repeat:\n")
-				print(idx_repeat)
-				'''
 				for i, k in enumerate(dup_list):
 					p_copy[:, k] = attn_sums[:, i]
 				extend = Variable(torch.zeros(batch_size, batch.max_art_oovs))
