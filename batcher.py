@@ -233,7 +233,8 @@ class Batcher(object):
       data_path: tf.Example filepattern.
       vocab: Vocabulary object
       hps: hyperparameters
-      single_pass: If True, run through the dataset exactly once (useful for when you want to run evaluation on the dev or test set). Otherwise generate random batches indefinitely (useful for training).
+      single_pass: If True, run through the dataset exactly once (useful for when you want to run evaluation on the dev or test set).
+      Otherwise generate random batches indefinitely (useful for training).
     """
     self._data_path = data_path
     self._vocab = vocab

@@ -1,5 +1,5 @@
 from torch.autograd import Variable
-import Counter
+from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,20 +16,23 @@ class Attention_Decoder(nn.Module):
 			attn_len: number of encoder hidden state to attend to.
 			unif_mag: magnitude of uniform distributuin.
 		'''
+		super(Attention_Decoder, self).__init__()
 		self.embed_dim = embed_dim
 		self.hidden_dim = hidden_dim
 		self.attn_len = attn_len
 		self.unif_mag = unif_mag
 
-		self.W_s = nn.linear(hidden_dim, hidden_dim)
-		self.input2x = nn.linear(2 * hidden_dim + embed_dim, embed_dim)
-		self.W_p_gen = nn.linear(4 * hidden_dim + embed_dim, 1)
-		self.W_out = nn.linear(3 * hidden_dim, hidden_dim)
+		self.W_s = nn.Linear(2 * hidden_dim, hidden_dim)
+		self.input2x = nn.Linear(2 * hidden_dim + embed_dim, embed_dim)
+		self.W_p_gen = nn.Linear(4 * hidden_dim + embed_dim, 1)
+		self.W_out = nn.Linear(3 * hidden_dim, hidden_dim)
 
 		self.W_h = nn.Conv2d(2 * hidden_dim, hidden_dim, 1)
 		self.W_c = nn.Conv2d(1, hidden_dim, 1)
-		self.v = nn.parameter(torch.Tensor(hidden_dim))
-		self.cell = nn.LSTMCell(embed_dim, hidden_dim)
+		self.v = nn.Parameter(torch.Tensor(hidden_dim))
+		self.cell = nn.LSTM(
+			embed_dim, hidden_dim, num_layers=1, batch_first=True
+			)
 		self._init_params_()
 
 	def _init_params_(self):
@@ -37,7 +40,135 @@ class Attention_Decoder(nn.Module):
 		nn.init.uniform(self.v)
 		if self.unif_mag != None:
 			for param in self.cell.parameters():
-				nn.init(param, a=-self.unif_mag, b=self.unif_mag)
+				nn.init.uniform(param, a=-self.unif_mag, b=self.unif_mag)
+
+	def decode_onestep(self, step, decoder_input, dec_in_state, encoder_states,
+					   encoder_features, enc_padding_mask, pointer_gen=True,
+					   use_coverage=False, prev_coverage=None, use_cuda=False,
+					   initial_state_attention=False):
+		'''
+		Args:
+			decoder_input: A 2-D tensor [batch_size * embed_size].
+			initial_state: 2-D tensor [batch_size * hidden_dim].
+			encoder_states: 3-D tensor [batch_size * attn_len * 2 * hidden_dim].
+			enc_padding_mask: 2-D tensor [batch_size * attn_len].
+							  Only contains 0s and 1s.
+							  0 for paddings and 1 for real tokens.
+			initial_state_attention: Only True for test.
+			pointer_gen: Whether to use pointer generator mechanism.
+			use_coverage: Whetherto use coverage mechanism.
+			prev_coverage: If not None, a 2-D tensor [batch_size * attn_len].
+		'''
+		batch_size, attn_len, _ = encoder_states.size()
+		
+		encoder_states = torch.unsqueeze(encoder_states, dim=2)
+
+		if prev_coverage is not None:
+			prev_coverage = torch.unsqueeze(
+				torch.unsqueeze(prev_coverage, 2), 3
+				)
+			# Turn to [batch_size * attn_len * 1 * 1]
+		def attention(decoder_state, coverage=None):
+			"""
+				Calculate the context vector and attention distribution 
+				from the decoder state.
+
+		        Args:
+		          decoder_state: state of the decoder
+		          coverage: Optional. Previous timestep's coverage vector, 
+		        		    shape (batch_size, attn_len, 1, 1).
+
+		        Returns:
+		          context_vector: weighted sum of encoder_states
+		          attn_dists: attention distribution
+		          coverage: new coverage vector.
+		          			Shape (batch_size, attn_len, 1, 1)
+	      	"""
+			decoder_features = self.W_s(torch.cat(decoder_state, dim=1))
+			decoder_features = torch.unsqueeze(
+      					torch.unsqueeze(decoder_features, 1), 1
+      					)
+			def masked_attention(e):
+				# e is a 2-D tensor [batch_size * attn_len]
+				attn_dist = F.softmax(e, dim=1)
+				attn_dist *= enc_padding_mask.float()
+				masked_sums = torch.sum(attn_dist, dim=1)
+				attn_dist /= torch.unsqueeze(masked_sums, dim=1)
+				return attn_dist
+			if use_coverage and coverage is not None:
+				coverage_features = self.W_c(coverage.permute(0, 3, 1, 2))
+				coverage_features = coverage_features.permute(0, 2, 3, 1)
+				# shape [batch_size * attn_len * 1 * hidden_dim]
+				e = torch.sum(self.v * F.tanh(
+					encoder_features + decoder_features + coverage_features
+					), dim=2)
+				e = torch.sum(e, dim=2)
+				# e is a 2-D tensor [batch_size * attn_len]
+				attn_dist = masked_attention(e)
+
+				coverage += attn_dist.resize(batch_size, -1, 1, 1)
+			else:
+				e = torch.sum(self.v * F.tanh(
+					encoder_features + decoder_features
+					), dim=2)
+				e = torch.sum(e, dim=2)
+
+				attn_dist = masked_attention(e)
+
+				if use_coverage:
+					coverage = torch.unsqueeze(
+						torch.unsqueeze(attn_dist, 2), 2
+						)
+			context_vector = torch.sum(
+				torch.unsqueeze(
+					torch.unsqueeze(attn_dist, 2), 3
+					) * encoder_states, dim=1
+				)
+			context_vector = torch.sum(context_vector, dim=1)
+			# context_vector is of size [batch_size * (2 * hidden_dim)]
+
+			return context_vector, attn_dist, coverage
+
+		h, c = dec_in_state
+		h = torch.unsqueeze(h, dim=0)
+		c = torch.unsqueeze(c, dim=0)
+		state = (h, c)
+		coverage = prev_coverage
+		context_vector = Variable(torch.zeros(batch_size, 2 * self.hidden_dim))
+		if use_cuda:
+			context_vector = context_vector.cuda()
+
+		if initial_state_attention:
+			context_vector, _, coverage = attention(dec_in_state, coverage)
+		
+		x = self.input2x(
+			torch.cat([decoder_input, context_vector], dim=1)
+			)
+		x_ = torch.unsqueeze(x, dim=1)
+
+		cell_output, (h, c) = self.cell(x_, state)
+		cell_output = torch.squeeze(cell_output)
+		h = torch.squeeze(h)
+		c = torch.squeeze(c)
+		state = (h, c)
+
+		if step == 0 and initial_state_attention:
+			context_vector, attn_dist, _ = attention(state, coverage)
+		else:
+			context_vector, attn_dist, coverage = attention(state, coverage)
+
+		if pointer_gen:
+			c, h = state
+			p_gen = self.W_p_gen(
+				torch.cat([context_vector, c, h, x], dim=1)
+				)
+			p_gen = F.sigmoid(p_gen)
+
+		output = self.W_out(torch.cat([cell_output, context_vector], dim=1))
+
+		if coverage is not None:
+			coverage = torch.squeeze(coverage)
+		return output, state, attn_dist, p_gen, coverage
 	
 	def forward(self, decoder_inputs, initial_state, encoder_states,
 				enc_padding_mask, initial_state_attention=False,
@@ -58,118 +189,38 @@ class Attention_Decoder(nn.Module):
 			use_coverage: Whetherto use coverage mechanism.
 			prev_coverage: If not None, a 2-D tensor [batch_size * attn_len].
 		'''
-		batch_size, attn_len, _ = encoder_states.size()
 		
-		encoder_states = torch.unsqueeze(encoder_states, dim=2)
-		encoder_features = self.W_h(encoder_states.permute(0, 3, 1, 2))
+		encoder_states_ = torch.unsqueeze(encoder_states, dim=2)
+		encoder_features = self.W_h(encoder_states_.permute(0, 3, 1, 2))
 		encoder_features = encoder_features.permute(0, 2, 3, 1)
 
-		if prev_coverage is not None:
-			prev_coverage = torch.unsqueeze(
-				torch.unsqueeze(prev_coverage, 2), 3
-				)
-			# Turn to [batch_size * attn_len * 1 * 1]
-		def attention(decoder_state, coverage=None):
-		"""
-			Calculate the context vector and attention distribution 
-			from the decoder state.
-
-	        Args:
-	          decoder_state: state of the decoder
-	          coverage: Optional. Previous timestep's coverage vector, 
-	        		    shape (batch_size, attn_len, 1, 1).
-
-	        Returns:
-	          context_vector: weighted sum of encoder_states
-	          attn_dists: attention distribution
-	          coverage: new coverage vector.
-	          			Shape (batch_size, attn_len, 1, 1)
-      """
-      		decoder_fearures = self.W_s(decoder_state)
-      		decoder_features = torch.unsqueeze(
-      					torch.unsqueeze(decoder_fearures, 1), 1
-      					)
-      		def masked_attention(e):
-      			# e is a 2-D tensor [batch_size * attn_len]
-	      		attn_dist = F.sofmax(e, dim=1)
-	      		attn_dist *= enc_padding_mask
-	      		masked_sums = torch.sum(attn_dist, dim=1)
-	      		attn_dist /= masked_sums.resize(-1, 1)
-	      		return attn_dist
-	      	if use_coverage and coverage is not None:
-	      		coverage_features = self.W_c(coverage.permute(0, 3, 1, 2))
-	      		coverage_features = coverage_features.permute(0, 2, 3, 1)
-	      		# shape [batch_size * attn_len * 1 * hidden_dim]
-	      		e = torch.sum(v * F.tanh(
-	      			encoder_features + decoder_fearures + coverage_features
-	      			), dim=2)
-	      		e = torch.sum(e, dim=2)
-	      		# e is a 2-D tensor [batch_size * attn_len]
-	      		attn_dist = masked_attention(e)
-
-	      		coverage += attn_dist.resize(batch_size, -1, 1, 1)
-	      	else:
-	      		e = torch.sum(v * F.tanh(
-	      			encoder_features + decoder_fearures + coverage_features
-	      			), dim=2)
-	      		e = torch.sum(e, dim=2)
-
-	      		attn_dist = masked_attention(e)
-
-	      		if use_coverage:
-	      			coverage = torch.unsqueeze(
-	      				torch.unsqueeze(attn_dist, 2), 2
-	      				)
-	      	context_vector = torch.sum(
-	      		attn_dist.reshape(batch_size, -1, 1, 1) * encoder_states, dim=1
-	      		)
-	      	context_vector = torch.sum(context_vector, dim=1)
-	      	context_vector = context_vector.reshape(-1, 2 * self.hidden_dim)
-	      	# context_vector is of size [batch_size * (2 * hidden_dim)]
-
-	      	return context_vector, attn_dist, coverage
 		outputs = []
 		attn_dists = []
 		p_gens = []
 		state = initial_state
-		coverage = prev_coverage
-		context_vector = Variable(torch.zeros(batch_size, 2 * self.hidden_dim))
-		if use_cuda:
-			context_vector = context_vector.cuda()
-
-		if initial_state_attention:
-			context_vector, _, coverage = attention(initial_state, coverage)
+		
 		for i, inp in enumerate(decoder_inputs):
-			x = self.input2x(torch.concat([inp, context_vector], dim=1))
-
-			cell_output, state = self.cell(x, state)
-
-			if i == 0 and initial_state_attention:
-				context_vector, attn_dist, _ = attention(state, coverage)
-			else:
-				context_vector, attn_dist, coverage = attention(state, coverage)
+			output, state, attn_dist, p_gen, coverage = self.decode_onestep(
+				i, inp, state, encoder_states, encoder_features,
+				enc_padding_mask, pointer_gen, use_coverage,
+				prev_coverage, use_cuda, initial_state_attention  
+				)
 			attn_dists.append(attn_dist)
 
 			if pointer_gen:
-				c, h = state
-				p_gen = self.W_p_gen(
-					torch.cat([context_vector, c, h, x], dim=1)
-					)
-				p_gen = F.sigmoid(p_gen)
 				p_gens.append(p_gen)
-			output = self.W_out(torch.cat([cell_output, context_vector]))
+
 			outputs.append(output)
-		if coverage is not None:
-			coverage = coverage.resize(batch_size, -1)
 		return outputs, state, attn_dists, p_gens, coverage
 
-class Summarization_Model(nn.module):
+class Summarization_Model(nn.Module):
 
 	def __init__(self, vocab_size, embed_dim, hidden_dim, attn_len,
 				 num_layers=1, mode='train', unif_mag=None,
 				 trunc_norm_std=None, pointer_gen=True,
 				 initial_state_attention=False, use_coverage=False,
 				 prev_coverage=None):
+		super(Summarization_Model, self).__init__()
 		# Initialize all relevant parameters.
 		self.vocab_size = vocab_size
 		self.embed_dim = embed_dim
@@ -194,13 +245,13 @@ class Summarization_Model(nn.module):
 				num_layers=num_layers, batch_first=True,
 				bidirectional=True
 				)
-		self.reduce_state_c = nn.linear(2 * num_layers * hidden_dim, hidden_dim)
-		self.reduce_state_h = nn.linear(2 * num_layers * hidden_dim, hidden_dim)
+		self.reduce_state_c = nn.Linear(2 * num_layers * hidden_dim, hidden_dim)
+		self.reduce_state_h = nn.Linear(2 * num_layers * hidden_dim, hidden_dim)
 
 		self.decoder = Attention_Decoder(
 					embed_dim, hidden_dim,attn_len, unif_mag
 					)
-		self.output_proj = nn.linear(hidden_dim, vocab_size)
+		self.output_proj = nn.Linear(hidden_dim, vocab_size)
 		self._init_params_()
 
 	def _init_params_(self):
@@ -214,6 +265,69 @@ class Summarization_Model(nn.module):
 
 		for param in self.output_proj.parameters():
 			nn.init.normal(param, std=self.trunc_norm_std)
+
+	def prob_output_onestep(self, decoder_output, attn_dist, p_gen, batch,
+							use_cuda):
+		batch_size, seq_len = batch.enc_batch.size()
+		# 5. Use decoder outputs to compute vocab_dists
+		vocab_score = self.output_proj(decoder_output)
+		vocab_dist = F.softmax(vocab_score, dim=1)
+
+		# 6. Use p_gen, vocab_dists and attn_dists to compute final_dists
+		if self.pointer_gen:
+			inputs = batch.enc_batch_extend_vocab.cpu().data.numpy()
+			numbers = inputs.reshape(-1).tolist()
+			set_numbers = list(set(numbers))
+			if 1 in set_numbers:
+				set_numbers.remove(1)
+			c = Counter(numbers)
+			dup_list = [k for k in set_numbers]
+
+			def compute_final_dist(attn, vocab_dist, p_gen):
+				attn_sum_list = []
+				for dup in dup_list:
+					mask = np.array(inputs == dup, dtype=float)
+					mask = Variable(torch.from_numpy(mask)).float()
+					if use_cuda:
+						mask = mask.cuda()
+					attn_mask = torch.mul(mask, attn)
+					attn_sum = attn_mask.sum(1).unsqueeze(1)
+					attn_sum_list.append(attn_sum)
+				attn_sums = torch.cat(attn_sum_list, dim=1)
+					
+				p_copy = torch.zeros(
+					batch_size, self.vocab_size + batch.max_art_oovs
+					)
+				p_copy = Variable(p_copy)
+				if use_cuda:
+					p_copy = p_copy.cuda()
+				
+				'''
+				print("attn size = {}".format(attn.size()))
+				print("batch_indices:\n")
+				print(batch_indices)
+				print("word_indices:\n")
+				print(word_indices)
+				print("idx_repeat:\n")
+				print(idx_repeat)
+				'''
+				for i, k in enumerate(dup_list):
+					p_copy[:, k] = attn_sums[:, i]
+				extend = Variable(torch.zeros(batch_size, batch.max_art_oovs))
+				if use_cuda:
+					extend = extend.cuda()
+				vocab_dist_ = torch.cat([vocab_dist, extend], dim=1)
+				p_out = torch.mul(vocab_dist_.t(), torch.squeeze(p_gen)) + \
+						torch.mul(p_copy.t(), (1-torch.squeeze(p_gen)))
+				p_out = p_out.t()
+				return p_out
+
+			final_dist = compute_final_dist(attn_dist, vocab_dist, p_gen)
+		else:
+			final_dist = vocab_dist
+	
+		# 7. Output final_dists for MLE loss and attn_dists for coverage loss
+		return final_dist
 
 	def forward(self, batch, use_cuda=False):
 		'''
@@ -231,7 +345,7 @@ class Summarization_Model(nn.module):
 		batch_size, seq_len = batch.enc_batch.size()
 		# 1. Embed enc_batch and dec_batch
 		emb_enc_inputs = self.embedding(batch.enc_batch)
-		emb_dec_inputs = [self.embedding(x) for x in torch.split(
+		emb_dec_inputs = [torch.squeeze(self.embedding(x)) for x in torch.split(
 					batch.dec_batch, 1, dim=1
 				)]
 		# 2. Compute encoder_outputs, h_t, c_t
@@ -241,6 +355,7 @@ class Summarization_Model(nn.module):
 			)
 		c_0 = Variable(
 			torch.zeros(2 * self.num_layers, batch_size, self.hidden_dim)
+			)
 		if use_cuda:
 			h_0 = h_0.cuda()
 			c_0 = c_0.cuda()
@@ -248,71 +363,29 @@ class Summarization_Model(nn.module):
 
 		# 3. Compute initial state for decoder
 		# new_h and new_c are of size [batch_size * hidden_dim]
-		new_c = self.reduce_state_c(c_t.permute(1, 0, 2).view(batch_size, -1))
-		new_h = self.reduce_state_h(h_t.permute(1, 0, 2).view(batch_size, -1))
+		new_c = self.reduce_state_c(
+			c_t.permute(1, 0, 2).contiguous().view(batch_size, -1)
+			)
+		new_h = self.reduce_state_h(
+			h_t.permute(1, 0, 2).contiguous().view(batch_size, -1)
+			)
 
 		# 4. Compute decoder outputs attn_dists and so on.
 		decoder_outputs, decoder_out_state, attn_dists, p_gens, coverage = \
-		self.decoder(batch.dec_batch, (new_h, new_c), encoder_outputs,
+		self.decoder(emb_dec_inputs, (new_h, new_c), encoder_outputs,
 				batch.enc_padding_mask, self.initial_state_attention,
 				self.pointer_gen, self.use_coverage, self.prev_coverage,
 				use_cuda)
 
-		# 5. Use decoder outputs to compute vocab_dists
-		vocab_scores = []
-		for output in decoder_outputs:
-			vocab_scores.append(self.output_proj(output))
-		vocab_dists = [F.softmax(s, dim=1) for s in vocab_scores]
-
-		# 6. Use p_gen, vocab_dists and attn_dists to compute final_dists
-		if self.pointer_gen:
-			inputs = batch.enc_batch.cpu().numpy()
-			numbers = inputs.reshape(-1).tolist()
-			set_numbers = list(set(numbers))
-			set_numbers.remove(1)
-			c = Counter(numbers)
-			dup_list = [k fo k in set_numbers if (c[k] > 1)]
-
-			def compute_final_dist(attn, vocab_dist, p_gen):
-				masked_idx_sum = np.zeros([batch_size, seq_len])
-				dup_attn_sum = Variable(torch.zeros([batch_size, seq_len]))
-				if use_cuda:
-					dup_attn_sum = dup_attn_sum.cuda()
-
-				for dup in dup_list:
-					mask = np.array(inputs == dup, dtype=float)
-					masked_idx_sum += mask
-					mask = Variable(torch.from_numpy(mask))
-					if use_cuda:
-						mask = mask.cuda()
-					attn_mask = torch.mul(mask, attn)
-					attn_sum = attn_mask.sum(1).unsqueeze(1)
-					dup_attn_sum += torch.mul(mask, attn_sum)
-				masked_idx_sum = Variable(torch,Tensor(masked_idx_sum))
-				if use_cuda:
-					masked_idx_sum = masked_idx_sum.cuda()
-				attn = torch.mul(attn, (1 - masked_idx_sum)) + dup_attn_sum
-				batch_indices = torch.arange(start=0, end=batch_size).long()
-				batch_indices = batch_indices.expand(seq_len, batch_size)
-				batch_indices = batch_indices.transpose(1, 0).contiguous()
-				batch_indices = batch_indices.view(-1)
-				idx_repeat = torch.arange(start=0, end=batch_size)
-				idx_repeat = idx_repeat.repeat(batch_size).long()
-				p_copy = torch.zeros(
-					batch_size, self.vocab_size + batch.max_art_oovs
+	
+		final_dists = []
+		for decoder_output, attn_dist, p_gen in zip(
+				decoder_outputs, attn_dists, p_gens):
+			final_dists.append(
+				self.prob_output_onestep(
+					decoder_output, attn_dist, p_gen, batch, use_cuda
 					)
-				if use_cuda:
-					p_copy = Variable(p_copy).cuda()
-				word_indices = inputs.reshape(-1)
-				p_copy[batch_indices, word_indices] += attn[
-						batch_indices, idx_repeat
-						]
-				p_out = torch.mul(vocab_dist, p_gen) + \
-						torch.mul(p_copy, (1-p_gen))
-				return p_out
-			final_dists = []
-			for attn, dist, p_gen in zip(attn_dists, vocab_dists, p_gens):
-				final_dists.append(compute_final_dist(attn, dist, p_gen))
-		
+				)
+	
 		# 7. Output final_dists for MLE loss and attn_dists for coverage loss
 		return final_dists, attn_dists
