@@ -31,23 +31,25 @@ import data
 from collections import namedtuple
 import numpy as np
 
-USE_CUDA=torch.cuda.is_available()
+# USE_CUDA=torch.cuda.is_available()
+USE_CUDA = False
 
 parser = argparse.ArgumentParser(description='PyTorch Suaamrization Training')
-# parser.add_argument('--data-path', metavar='DIR', default="/home/zhaoyuekai/torch_code/data/summary/finished_files/chunked/train_*", help='Path expression to tf.Example datafiles. Can include wildcards to access multiple datafiles.')
-# parser.add_argument('--vocab', metavar='DIR', default="/home/zhaoyuekai/torch_code/data/summary/finished_files/vocab",help='Path expression to text vocabulary file.')
+parser.add_argument('--data-path', metavar='DIR', default="/home/zhaoyuekai/torch_code/data/summary/finished_files/chunked/train_*", help='Path expression to tf.Example datafiles. Can include wildcards to access multiple datafiles.')
+parser.add_argument('--vocab', metavar='DIR', default="/home/zhaoyuekai/torch_code/data/summary/finished_files/vocab",help='Path expression to text vocabulary file.')
 # # Where to find data
-# parser.add_argument('--log-dir', metavar='DIR',default="/home/zhaoyuekai/torch_code/summarization/NLP-course/logs/",help='where to save logger.')
-# parser.add_argument('--path-to-checkpoint', metavar='DIR',default="/home/zhaoyuekai/torch_code/summarization/NLP-course/checkpoints",help='where to save checkpoint.')
+parser.add_argument('--log-dir', metavar='DIR',default="/home/zhaoyuekai/torch_code/summarization/NLP-course/logs/",help='where to save logger.')
+parser.add_argument('--path-to-checkpoint', metavar='DIR',default="/home/zhaoyuekai/torch_code/summarization/NLP-course/checkpoints",help='where to save checkpoint.')
 # # Important settings
-# parser.add_argument('--mode', default='train', type=str, help='must be one of train/eval/decode')
-
+parser.add_argument('--mode', default='train', type=str, help='must be one of train/eval/decode')
+'''
 parser.add_argument('--data-path', metavar='DIR',help='Path expression to tf.Example datafiles. Can include wildcards to access multiple datafiles.')
 parser.add_argument('--vocab', metavar='DIR', default="/home/huangshihan/Desktop/finished_files/vocab",help='Path expression to text vocabulary file.')
 parser.add_argument('--log-dir', metavar='DIR',default="/home/huangshihan/Desktop/finished_files/logger", help='where to save logger.')
 parser.add_argument('--path-to-checkpoint', metavar='DIR',default="/home/huangshihan/Desktop/finished_files/dir/", help='where to save checkpoint.')
 
 parser.add_argument('--mode', default='train', type=str, help='must be one of train/eval/decode')
+'''
 parser.add_argument('--single-pass', type=bool, default=True, help='For decode mode only. If True, run eval on the full dataset using a fixed checkpoint, i.e. take the current checkpoint, and use it to produce one summary for each example in the dataset, write the summaries to file and then get ROUGE scores for the whole dataset. If False (default), run concurrent decoding, i.e. repeatedly load latest checkpoint, use it to produce summaries for randomly-chosen examples and log the results to screen, indefinitely.')
 
 # Hyperparameters
@@ -55,11 +57,11 @@ parser.add_argument('--hidden-dim', type=int, default=256)
 parser.add_argument('--extended-vsize', type=int, default=55000)
 parser.add_argument('--emb-dim', type=int, default=128)
 parser.add_argument('--batch-size', type=int, default=16)
-parser.add_argument('--max-enc-steps', type=int, default=400)
+parser.add_argument('--max-enc-steps', type=int, default=400) 
 parser.add_argument('--max-dec-steps', type=int, default=100)
 parser.add_argument('--min-dec-steps', type=int, default=35)
 parser.add_argument('--vocab-size', type=int, default=50000)
-parser.add_argument('--lr', type=float, default=0.15)
+parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--adagrad-init-acc', type=float, default=0.1)
 parser.add_argument('--rand-unif-init-mag', type=float, default=0.02)
 parser.add_argument('--trunc-norm-init-std', type=float, default=1e-4)
@@ -72,7 +74,7 @@ parser.add_argument('--check-n', type=int, default=5)
 parser.add_argument('--pointer-gen',default=True,type=bool,help='If True, use pointer-generator model. If False, use baseline model.')
 
 # Coverage hyperparameters
-parser.add_argument('--coverage', default=False, type=bool,help='Use coverage mechanism. Note, the experiments reported in the ACL paper train WITHOUT coverage until converged, and then train for a short phase WITH coverage afterwards. i.e. to reproduce the results in the ACL paper, turn this off for most of training then turn on for a short phase at the end.')
+parser.add_argument('--coverage', default=True, type=bool,help='Use coverage mechanism. Note, the experiments reported in the ACL paper train WITHOUT coverage until converged, and then train for a short phase WITH coverage afterwards. i.e. to reproduce the results in the ACL paper, turn this off for most of training then turn on for a short phase at the end.')
 parser.add_argument('--cov-loss-wt', default=1.0, type=float,help='Weight of coverage loss (lambda in the paper). If zero, then no incentive to minimize coverage loss.')
 
 # Utility flags, for restoring and changing checkpoints
@@ -113,12 +115,14 @@ dataloader = Batcher(args.data_path, vocab, hps, args.single_pass)
 5. Initlialize a optimizer
 	>>> optimizer = torch.optim.Adagrad(**args)
 '''
-
+prev_coverage = Variable(torch.zeros(args.batch_size, args.max_enc_steps))
+if USE_CUDA:
+	prev_coverage = prev_coverage.cuda()
 net = Summarization_Model(args.vocab_size,args.emb_dim,args.hidden_dim,args.max_enc_steps,
 				num_layers=1, mode='train', unif_mag=0.02,
 				trunc_norm_std=1e-4, pointer_gen=True,
-				initial_state_attention=False, use_coverage=False,
-				prev_coverage=None)
+				initial_state_attention=False, use_coverage=True,
+				prev_coverage=prev_coverage)
 
 if USE_CUDA:
 	net = net.cuda()
@@ -144,21 +148,26 @@ logger = Logger(args.log_dir)
 def log(tag, value, step):
 	logger.scalar_summary(tag, value, step)
 
-def loss_function(final_dists,atten_dists,batch):
+def loss_function(final_dists, attn_dists, batch):
 	if args.pointer_gen:
 		loss_per_step=[]
 		for dec_step, dist in enumerate(final_dists):
 			# print(dist.numpy()[0])
 			targets = batch.target_batch[:,dec_step].contiguous().view(-1, 1)
-			targets_ = targets.data
+			targets_ = targets.data.cpu()
 			indices = torch.arange(args.batch_size).view(-1, 1).long()
-			gold_probs = dist[indices, targets_]
+			gold_probs = Variable(torch.zeros(args.batch_size, 1))
+			if USE_CUDA:
+				gold_probs = gold_probs.cuda()
+			targets_ = targets_.numpy()
+			indices = indices.numpy()
+			gold_probs = dist[indices, targets_].clone()
 			# print(gold_probs)
-			losses = -torch.log(gold_probs)
+			losses = -torch.log(gold_probs.squeeze())
 			loss_per_step.append(losses)
 		loss = _mask_and_avg(loss_per_step, batch.dec_padding_mask)
 	if args.coverage:
-		coverage_loss = _coverage_loss(atten_dists, batch.dec_padding_mask)
+		coverage_loss = _coverage_loss(attn_dists, batch.dec_padding_mask)
 		loss = loss + args.cov_loss_wt*coverage_loss
 	return loss
 
@@ -173,10 +182,11 @@ def _mask_and_avg(values, padding_mask):
     a scalar
   	"""
 	dec_lens = torch.sum(padding_mask,dim=1)
-	values_per_step = [v*padding_mask[:,dec_step] for dec_step,v in enumerate(values)]
-	values_per_ex = sum(values_per_step)/dec_lens
+	losses = torch.stack(values, dim=1)
+	losses = losses * padding_mask
+	values_per_ex = torch.sum(losses, dim=1)/dec_lens
 	return torch.sum(values_per_ex)
-def _coverage_loss(atten_dists, padding_mask):
+def _coverage_loss(attn_dists, padding_mask):
 	"""Calculates the coverage loss from the attention distributions.
 
   Args:
@@ -191,7 +201,7 @@ def _coverage_loss(atten_dists, padding_mask):
 	for a in attn_dists:
 		covloss = torch.sum(torch.min(a,coverage), dim=1)
 		covlosses.append(covloss)
-		coverage += a
+		coverage = coverage + a
 	coverage_loss = _mask_and_avg(covlosses, padding_mask)
 	return coverage_loss
 
@@ -207,15 +217,28 @@ def _coverage_loss(atten_dists, padding_mask):
 	>>> logger
 	>>> save_checkpoint()
 '''
+print(net)
 for n in range(args.num_steps):
 	batch = dataloader.next_batch()
 	batch = batch2var(batch, use_cuda=USE_CUDA)
+	final_dists, attn_dists = net(batch, USE_CUDA)
 	loss = loss_function(final_dists, attn_dists, batch)
-	print("------step------:", n)
-	print("------loss------",loss.data[0])
 	optimizer.zero_grad()
 	loss.backward()
+	torch.nn.utils.clip_grad_norm(net.parameters(), max_norm=3.0)
+	'''
+	for param in net.parameters():
+		print(param.size())
+		print(torch.mean(param.grad))
+	'''
 	optimizer.step()
+	'''
+	for param in net.parameters():
+		print(param.size())
+		print(torch.mean(param.data))
+	'''
+	print("------step------:", n)
+	print("------loss------",loss.data[0])
 	log('loss', loss.data[0], step=n)
 	if n % args.check_n == 0:
 		save_checkpoint({
@@ -223,5 +246,5 @@ for n in range(args.num_steps):
 			'state_dict': net.state_dict(),
 			'optimizer' : optimizer.state_dict()},
 			is_best=False)
-	if n > 100:
+	if n > 10:
 		break

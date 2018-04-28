@@ -91,22 +91,28 @@ class Attention_Decoder(nn.Module):
 			def masked_attention(e):
 				# e is a 2-D tensor [batch_size * attn_len]
 				attn_dist = F.softmax(e, dim=1)
-				attn_dist *= enc_padding_mask.float()
+				attn_dist = attn_dist * enc_padding_mask.float()
 				masked_sums = torch.sum(attn_dist, dim=1)
-				attn_dist /= torch.unsqueeze(masked_sums, dim=1)
+				attn_dist = attn_dist / torch.unsqueeze(masked_sums, dim=1)
 				return attn_dist
+
 			if use_coverage and coverage is not None:
 				coverage_features = self.W_c(coverage.permute(0, 3, 1, 2))
 				coverage_features = coverage_features.permute(0, 2, 3, 1)
 				# shape [batch_size * attn_len * 1 * hidden_dim]
+				features = encoder_features + decoder_features
+				features = features + coverage_features
 				e = torch.sum(self.v * F.tanh(
-					encoder_features + decoder_features + coverage_features
+						features
 					), dim=2)
 				e = torch.sum(e, dim=2)
 				# e is a 2-D tensor [batch_size * attn_len]
 				attn_dist = masked_attention(e)
 
-				coverage += attn_dist.resize(batch_size, -1, 1, 1)
+	
+				coverage = coverage + torch.unsqueeze(
+					torch.unsqueeze(attn_dist, 2), dim=3
+					)
 			else:
 				e = torch.sum(self.v * F.tanh(
 					encoder_features + decoder_features
@@ -162,6 +168,7 @@ class Attention_Decoder(nn.Module):
 			p_gen = self.W_p_gen(
 				torch.cat([context_vector, c, h, x], dim=1)
 				)
+
 			p_gen = F.sigmoid(p_gen)
 
 		output = self.W_out(torch.cat([cell_output, context_vector], dim=1))
@@ -206,11 +213,13 @@ class Attention_Decoder(nn.Module):
 				prev_coverage, use_cuda, initial_state_attention  
 				)
 			attn_dists.append(attn_dist)
+			prev_coverage = coverage
 
 			if pointer_gen:
 				p_gens.append(p_gen)
 
 			outputs.append(output)
+
 		return outputs, state, attn_dists, p_gens, coverage
 
 class Summarization_Model(nn.Module):
@@ -233,10 +242,8 @@ class Summarization_Model(nn.Module):
 		self.initial_state_attention = initial_state_attention
 		self.pointer_gen = pointer_gen
 		self.use_coverage = use_coverage
-		if mode == 'decode' and prev_coverage:
+		if use_coverage:
 			self.prev_coverage = prev_coverage
-		else:
-			self.prev_coverage = None
 
 
 		self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -294,6 +301,7 @@ class Summarization_Model(nn.Module):
 					attn_sum = attn_mask.sum(1).unsqueeze(1)
 					attn_sum_list.append(attn_sum)
 				attn_sums = torch.cat(attn_sum_list, dim=1)
+				# print(attn_sums)
 					
 				p_copy = torch.zeros(
 					batch_size, self.vocab_size + batch.max_art_oovs
@@ -303,13 +311,15 @@ class Summarization_Model(nn.Module):
 					p_copy = p_copy.cuda()
 				
 				for i, k in enumerate(dup_list):
-					p_copy[:, k] = attn_sums[:, i]
+					p_copy[:, k] = attn_sums[:, i].clone()
 				extend = Variable(torch.zeros(batch_size, batch.max_art_oovs))
 				if use_cuda:
 					extend = extend.cuda()
 				vocab_dist_ = torch.cat([vocab_dist, extend], dim=1)
+				# print(vocab_dist)
+				# print(p_copy)
 				p_out = torch.mul(vocab_dist_.t(), torch.squeeze(p_gen)) + \
-						torch.mul(p_copy.t(), (1-torch.squeeze(p_gen)))
+						torch.mul(p_copy.t(), 1-torch.squeeze(p_gen))
 				p_out = p_out.t()
 				return p_out
 
