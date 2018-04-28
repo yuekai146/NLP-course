@@ -118,9 +118,10 @@ dataloader = Batcher(args.data_path, vocab, hps, args.single_pass)
 prev_coverage = Variable(torch.zeros(args.batch_size, args.max_enc_steps))
 if USE_CUDA:
 	prev_coverage = prev_coverage.cuda()
-net = Summarization_Model(args.vocab_size,args.emb_dim,args.hidden_dim,args.max_enc_steps,
-				num_layers=1, mode='train', unif_mag=0.02,
-				trunc_norm_std=1e-4, pointer_gen=True,
+net = Summarization_Model(
+				args.vocab_size, args.emb_dim, args.hidden_dim,
+				args.max_enc_steps, num_layers=1, mode='train',
+				unif_mag=0.02, trunc_norm_std=1e-4, pointer_gen=True,
 				initial_state_attention=False, use_coverage=True,
 				prev_coverage=prev_coverage)
 
